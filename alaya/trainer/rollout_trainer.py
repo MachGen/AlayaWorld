@@ -1249,7 +1249,11 @@ class RolloutTrainer:
             global_idx = int(_slot) if _slot is not None else 0
             sample_idx = global_idx % len(dataset)
             batch = dataset[sample_idx]
+            torch.cuda.synchronize()
+            self._perf = {"t0": time.perf_counter(), "step_s": [], "vae_decode_s": 0.0}
             video_pixels, caption, metadata = self._unpack_batch(batch)
+            if metadata.get("seed") is not None:
+                torch.manual_seed(int(metadata["seed"]))
             target_base_start = self.cfg.layout.sink_latent_frames + gap_steps + N + explicit_condition
             if self._uses_vigeo_prefix_last_frame():
                 latent_full = self._build_vigeo_validation_latent_full(
@@ -1343,6 +1347,8 @@ class RolloutTrainer:
                     gap_steps=gap_steps,
                     cond_end=cond_end,
                 )
+                torch.cuda.synchronize()
+                self._perf["rollout_s"] = time.perf_counter() - self._perf["t0"]
                 _vtag = "" if _n_variants <= 1 else f"_var{_vi:02d}"
                 stem = f"rank-{self.dist.rank:03d}_global-{global_idx:06d}_sample-{sample_idx:06d}{_vtag}"
                 if _pad_slot:
@@ -1460,6 +1466,11 @@ class RolloutTrainer:
                             gap_steps=gap_steps,
                             cond_end=cond_end,
                         )
+                self._perf["dit_s"] = sum(self._perf["step_s"])
+                self._perf["e2e_s"] = self._perf["rollout_s"] + self._perf["vae_decode_s"]  # excludes mp4 writing
+                self._perf.pop("t0")
+                with (mode_dir / "perf.jsonl").open("a", encoding="utf-8") as _pf:
+                    _pf.write(json.dumps({"stem": stem, "sample_idx": sample_idx, **self._perf}) + "\n")
                 del context, scheduled_contexts, metrics, pred_latents, nearby_condition_latents, spatial_condition_latents, spatial_condition_masks, spatial_condition_prefix_latents, payload
                 self._cleanup_after_validation()
             del batch, video_pixels, latent_full, negative_context
@@ -2353,6 +2364,8 @@ class RolloutTrainer:
                 x_t = torch.randn(B, latent_full.shape[1], K, H_lat, W_lat, device=self.dist.device, dtype=self.dtype)
             sampling_started = time.monotonic()
             for sample_step in range(len(sigmas) - 1):
+                torch.cuda.synchronize()
+                _step_t0 = time.perf_counter()
                 sigma_now = sigmas[sample_step]
                 sigma_next = sigmas[sample_step + 1]
 
@@ -2424,6 +2437,8 @@ class RolloutTrainer:
                     x_t = x_t - dt * pred_v
                 else:
                     x_t = (x_t.float() - pred_v.float() * sigma_now.float()).to(x_t.dtype)
+                torch.cuda.synchronize()
+                self._perf["step_s"].append(time.perf_counter() - _step_t0)
 
             pred = x_t[:, :, explicit_condition:] if inline else x_t
             if (
@@ -2825,6 +2840,10 @@ class RolloutTrainer:
                 like_frames=condition_frames if condition_frames is not None else pred_frames,
             )
         self._write_video(mode_dir / f"{stem}_pred_clean.mp4", pred_frames)
+        # raw RGB last frame before mp4 encoding (lossless), for last-frame continuation
+        from PIL import Image as _PILImage
+
+        _PILImage.fromarray(pred_frames[-1].cpu().numpy()).save(mode_dir / f"{stem}_pred_last.png")
         if self.cfg.validation.save_joystick:
             gt_label_indices = torch.arange(
                 keep_start,
@@ -3063,6 +3082,8 @@ class RolloutTrainer:
         overlap = max(0, int(self.cfg.runtime.vae_decode_overlap_latents))
         frames = []
         total_latents = int(latent.shape[2])
+        torch.cuda.synchronize()
+        _dec_t0 = time.perf_counter()
         for start in range(0, total_latents, chunk_latents):
             end = min(total_latents, start + chunk_latents)
             left = max(0, start - overlap)
@@ -3085,6 +3106,8 @@ class RolloutTrainer:
             del chunk, pixel, chunk_frames
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        self._perf["vae_decode_s"] += time.perf_counter() - _dec_t0
         return torch.cat(frames, dim=0)
 
     def _decode_latent_to_bank_pixels(self, latent: torch.Tensor) -> torch.Tensor:
@@ -4366,15 +4389,20 @@ class RolloutTrainer:
         return K.contiguous()
 
     def _write_video(self, path: Path, frames: torch.Tensor) -> None:
-        from torchvision.io import write_video
+        # torchvision >= 0.26 dropped io.write_video, encode with PyAV directly
+        import av
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_video(
-            str(path),
-            frames,
-            fps=int(self.cfg.sample.fps),
-            options={"crf": "18", "preset": "veryfast"},
-        )
+        container = av.open(str(path), mode="w")
+        stream = container.add_stream("libx264", rate=int(self.cfg.sample.fps), options={"crf": "18", "preset": "veryfast"})
+        stream.pix_fmt = "yuv420p"
+        stream.height, stream.width = int(frames.shape[1]), int(frames.shape[2])
+        for frame in frames.cpu().numpy():
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
 
     def _unpack_batch(self, batch: Any) -> tuple[torch.Tensor, str, dict[str, Any]]:
         if isinstance(batch, dict):

@@ -42,6 +42,7 @@ class CustomI2VDataset(Dataset):
         poses_per_image: int = 1,
         pose_stride: int = 40,
         captions_json: str | None = None,
+        seeds_json: str | None = None,
         prompt_file: str | None = None,
     ) -> None:
         self.width = int(width)
@@ -61,6 +62,10 @@ class CustomI2VDataset(Dataset):
         if captions_json:
             with open(captions_json, "r", encoding="utf-8") as f:
                 self.captions = {str(k): str(v) for k, v in json.load(f).items()}
+        self.seeds: dict[str, int] = {}
+        if seeds_json:
+            with open(seeds_json, "r", encoding="utf-8") as f:
+                self.seeds = {str(k): int(v) for k, v in json.load(f).items()}
         self._to_tensor = transforms.ToTensor()
 
         self.images = sorted(
@@ -180,4 +185,7 @@ class CustomI2VDataset(Dataset):
         }
         # Per-image caption (try stem then file name), falling back to the generic prompt
         caption = self.captions.get(img_path.stem) or self.captions.get(img_path.name) or self.caption
+        seed = self.seeds.get(img_path.stem, self.seeds.get(img_path.name))
+        if seed is not None:
+            metadata["seed"] = seed
         return {"video_pixels": video_pixels, "caption": caption, "metadata": metadata}

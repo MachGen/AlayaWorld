@@ -441,6 +441,7 @@ class ValidationDatasetConfig:
     poses_per_image: int = 1
     pose_stride: int = 40
     captions_json: str | None = None
+    seeds_json: str | None = None      # optional per-image seed (same keys as captions_json), seeds the sampling noise
     prompt_file: str | None = None     # optional shared prompt for custom_i2v images
 
 

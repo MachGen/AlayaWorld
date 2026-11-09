@@ -341,6 +341,7 @@ def build_validation_dataset(
             poses_per_image=int(getattr(mode_cfg.dataset, "poses_per_image", 1) or 1),
             pose_stride=int(getattr(mode_cfg.dataset, "pose_stride", 40) or 40),
             captions_json=getattr(mode_cfg.dataset, "captions_json", None),
+            seeds_json=getattr(mode_cfg.dataset, "seeds_json", None),
             prompt_file=mode_cfg.dataset.prompt_file,
         )
     if source_name == "wbench_navi":
